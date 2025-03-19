@@ -46,6 +46,7 @@
                                     <segment title="YOLO11m" width="75"/>
                                     <segment title="YOLO11l" width="69"/>
                                     <segment title="YOLO11x" width="69"/>
+                                    <segment title="YOLObest" width="69"/>
                                 </segments>
                                 <connections>
                                     <action selector="indexChanged:" destination="BYZ-38-t0r" eventType="valueChanged" id="3y2-Ij-sA7"/>

@@ -16,6 +16,7 @@ import CoreML
 import CoreMedia
 import UIKit
 import Vision
+import Speech
 
 var mlModel = try! yolo11m(configuration: mlmodelConfig).model
 var mlmodelConfig: MLModelConfiguration = {
@@ -67,6 +68,22 @@ class ViewController: UIViewController {
   var longSide: CGFloat = 3
   var shortSide: CGFloat = 4
   var frameSizeCaptured = false
+  // Sesli bildirim için
+  let speechSynthesizer = AVSpeechSynthesizer()
+  var platesQueue: [(rect: CGRect, label: String)] = []
+  var isReading = false
+  var lastProximityWarningTime: TimeInterval = 0
+  let proximityWarningCooldown: TimeInterval = 5.0 // Seconds between warnings
+  let proximityThreshold: CGFloat = 0.70 // License plate must cover at least 70% of screen width or height
+    
+  private let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))!
+  private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
+  private var recognitionTask: SFSpeechRecognitionTask?
+  private let audioEngine = AVAudioEngine()
+  private var isVoiceCommandMenuActive = false
+  private var voiceCommandMicIndicator: UIView?
+
+
 
   // Developer mode
   let developerMode = UserDefaults.standard.bool(forKey: "developer_mode")  // developer mode selected in settings
@@ -84,16 +101,554 @@ class ViewController: UIViewController {
     request.imageCropAndScaleOption = .scaleFill  // .scaleFit, .scaleFill, .centerCrop
     return request
   }()
+    
+    
+    // MARK: - Voice Command Actions
 
-  override func viewDidLoad() {
-    super.viewDidLoad()
-    slider.value = 30
-    setLabels()
-    setUpBoundingBoxViews()
-    setUpOrientationChangeNotification()
-    startVideo()
-    // setModel()
-  }
+    
+    // Similar improvements for other plate-finding functions
+    func findNearestLicensePlate() {
+        var nearestPlate: (rect: CGRect, distance: CGFloat, position: String)? = nil
+        let centerX = videoPreview.bounds.width / 2
+        let centerY = videoPreview.bounds.height / 2
+        let centerPoint = CGPoint(x: centerX, y: centerY)
+        
+        // Check all visible bounding boxes
+        for i in 0..<boundingBoxViews.count {
+            if !boundingBoxViews[i].shapeLayer.isHidden {
+                // Get label text to check if it's a license plate
+                let boxLabel = boundingBoxViews[i].textLayer.string as? String ?? ""
+                
+                if boxLabel.lowercased().contains("license_plate") {
+                    // Get frame from the shape layer's path
+                    if let path = boundingBoxViews[i].shapeLayer.path {
+                        let boxFrame = UIBezierPath(cgPath: path).bounds
+                        
+                        // Calculate distance from center of screen to center of box
+                        let boxCenterX = boxFrame.midX
+                        let boxCenterY = boxFrame.midY
+                        let boxCenter = CGPoint(x: boxCenterX, y: boxCenterY)
+                        
+                        let dx = centerPoint.x - boxCenter.x
+                        let dy = centerPoint.y - boxCenter.y
+                        let distance = sqrt(dx*dx + dy*dy)
+                        
+                        // Get position description
+                        let position = determinePlatePosition(rect: boxFrame, viewWidth: videoPreview.bounds.width)
+                        
+                        // If this is the first or closer than current nearest
+                        if nearestPlate == nil || distance < nearestPlate!.distance {
+                            nearestPlate = (boxFrame, distance, position)
+                        }
+                    }
+                }
+            }
+        }
+        
+        if let plate = nearestPlate {
+            // More detailed directional guidance based on position
+            let directionGuidance = getDirectionalGuidance(for: plate.position)
+            speakText("Nearest license plate is \(plate.position). \(directionGuidance)")
+        } else {
+            speakText("No license plates detected")
+        }
+        
+        // Continue voice recognition after a short delay
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            if self.isVoiceCommandMenuActive {
+                self.startSpeechRecognition()
+            }
+        }
+    }
+
+    // Similar improvements for other plate-finding functions
+    func findFarthestLicensePlate() {
+        var farthestPlate: (rect: CGRect, distance: CGFloat, position: String)? = nil
+        let centerX = videoPreview.bounds.width / 2
+        let centerY = videoPreview.bounds.height / 2
+        let centerPoint = CGPoint(x: centerX, y: centerY)
+        
+        // Check all visible bounding boxes
+        for i in 0..<boundingBoxViews.count {
+            if !boundingBoxViews[i].shapeLayer.isHidden {
+                // Get label text to check if it's a license plate
+                let boxLabel = boundingBoxViews[i].textLayer.string as? String ?? ""
+                
+                if boxLabel.lowercased().contains("license_plate") {
+                    // Get frame from the shape layer's path
+                    if let path = boundingBoxViews[i].shapeLayer.path {
+                        let boxFrame = UIBezierPath(cgPath: path).bounds
+                        
+                        // Calculate distance from center of screen to center of box
+                        let boxCenterX = boxFrame.midX
+                        let boxCenterY = boxFrame.midY
+                        let boxCenter = CGPoint(x: boxCenterX, y: boxCenterY)
+                        
+                        let dx = centerPoint.x - boxCenter.x
+                        let dy = centerPoint.y - boxCenter.y
+                        let distance = sqrt(dx*dx + dy*dy)
+                        
+                        // Get position description
+                        let position = determinePlatePosition(rect: boxFrame, viewWidth: videoPreview.bounds.width)
+                        
+                        // If this is the first or farther than current farthest
+                        if farthestPlate == nil || distance > farthestPlate!.distance {
+                            farthestPlate = (boxFrame, distance, position)
+                        }
+                    }
+                }
+            }
+        }
+        
+        if let plate = farthestPlate {
+            // More detailed directional guidance based on position
+            let directionGuidance = getDirectionalGuidance(for: plate.position)
+            speakText("Farthest license plate is \(plate.position). \(directionGuidance)")
+        } else {
+            speakText("No license plates detected")
+        }
+        
+        // Continue voice recognition after a short delay
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            if self.isVoiceCommandMenuActive {
+                self.startSpeechRecognition()
+            }
+        }
+    }
+
+    
+    func findRandomLicensePlate() {
+        var licensePlates: [(rect: CGRect, position: String)] = []
+        
+        // Collect all license plates
+        for i in 0..<boundingBoxViews.count {
+            if !boundingBoxViews[i].shapeLayer.isHidden {
+                // Get label text to check if it's a license plate
+                let boxLabel = boundingBoxViews[i].textLayer.string as? String ?? ""
+                
+                if boxLabel.lowercased().contains("license_plate") {
+                    // Get frame from the shape layer's path
+                    if let path = boundingBoxViews[i].shapeLayer.path {
+                        let boxFrame = UIBezierPath(cgPath: path).bounds
+                        let position = determinePlatePosition(rect: boxFrame, viewWidth: videoPreview.bounds.width)
+                        licensePlates.append((boxFrame, position))
+                    }
+                }
+            }
+        }
+        
+        if !licensePlates.isEmpty {
+            // Pick a random license plate
+            let randomIndex = Int.random(in: 0..<licensePlates.count)
+            let randomPlate = licensePlates[randomIndex]
+            let directionGuidance = getDirectionalGuidance(for: randomPlate.position)
+            speakText("Random license plate is \(randomPlate.position). \(directionGuidance)")
+        } else {
+            speakText("No license plates detected")
+        }
+        
+        // Continue voice recognition after a short delay
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            if self.isVoiceCommandMenuActive {
+                self.startSpeechRecognition()
+            }
+        }
+    }
+
+    func countLicensePlates() {
+        var count = 0
+        
+        // Count all license plates
+        for i in 0..<boundingBoxViews.count {
+            if !boundingBoxViews[i].shapeLayer.isHidden {
+                // Get label text to check if it's a license plate
+                let boxLabel = boundingBoxViews[i].textLayer.string as? String ?? ""
+                
+                if boxLabel.lowercased().contains("license_plate") {
+                    count += 1
+                }
+            }
+        }
+        
+        if count == 0 {
+            speakText("No license plates detected")
+        } else if count == 1 {
+            speakText("There is 1 license plate detected")
+        } else {
+            speakText("There are \(count) license plates detected")
+        }
+        
+        // Continue voice recognition
+        startSpeechRecognition()
+    }
+
+    // Improved help information
+    func provideHelpInformation() {
+        let helpText = """
+        Available commands:
+        Take me to the nearest license plate - I'll guide you to the closest license plate
+        Take me to the farthest license plate - I'll guide you to the most distant license plate
+        Take me to a random license plate - I'll guide you to a randomly selected license plate
+        How many license plates are detected - I'll count visible license plates
+        Help - Repeats this information
+        Exit voice command menu - Closes this menu and returns to normal operation
+        """
+        
+        speakText(helpText)
+        
+        print("Help information provided, will restart speech recognition after speech completes")
+        
+        // Continue voice recognition after speech finishes
+        // This special handling for help command prevents the recognition loop problem
+        if !speechSynthesizer.isSpeaking {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10.0) {
+                if self.isVoiceCommandMenuActive {
+                    print("Starting new recognition session after help")
+                    self.startSpeechRecognition()
+                }
+            }
+        }
+    }
+    
+    
+    func processVoiceCommand(_ command: String) {
+        // Convert command to lowercase for easier matching
+        let lowerCommand = command.lowercased()
+        print("Processing command: \(lowerCommand)")
+        
+        // Find nearest license plate
+        if lowerCommand.contains("nearest") && lowerCommand.contains("license plate") ||
+           lowerCommand.contains("en yakın") && lowerCommand.contains("plaka") {
+            findNearestLicensePlate()
+        }
+        // Find farthest license plate
+        else if lowerCommand.contains("farthest") && lowerCommand.contains("license plate") ||
+                lowerCommand.contains("en uzak") && lowerCommand.contains("plaka") {
+            findFarthestLicensePlate()
+        }
+        // Find random license plate
+        else if lowerCommand.contains("random") && lowerCommand.contains("license plate") ||
+                lowerCommand.contains("rastgele") && lowerCommand.contains("plaka") {
+            findRandomLicensePlate()
+        }
+        // Count license plates
+        else if lowerCommand.contains("how many") && lowerCommand.contains("license plate") ||
+                lowerCommand.contains("kaç") && lowerCommand.contains("plaka") {
+            countLicensePlates()
+        }
+        // Help command
+        else if lowerCommand.contains("help") || lowerCommand.contains("yardım") ||
+                lowerCommand.contains("what can i") || lowerCommand.contains("ne yapabilirim") {
+            provideHelpInformation()
+        }
+        // Exit voice command menu
+        else if lowerCommand.contains("exit") || lowerCommand.contains("quit") ||
+                lowerCommand.contains("çık") || lowerCommand.contains("kapat") {
+            speakText("Exiting voice command menu")
+            stopVoiceCommandMenu()
+            return
+        }
+        // Command not recognized
+        else {
+            speakText("Command not recognized. Say help for available commands.")
+        }
+        
+        // For commands other than "exit", restart speech recognition after a short delay
+        if isVoiceCommandMenuActive && !lowerCommand.contains("exit") && !lowerCommand.contains("quit") &&
+           !lowerCommand.contains("çık") && !lowerCommand.contains("kapat") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                if self.isVoiceCommandMenuActive {
+                    print("Restarting speech recognition after command")
+                    self.startSpeechRecognition()
+                }
+            }
+        }
+    }
+
+    // Updated voice command menu activation
+    func startVoiceCommandMenu() {
+        print("Attempting to start voice command menu with fixed configuration")
+        
+        // First check to see if we're already in voice command mode
+        if isVoiceCommandMenuActive {
+            speakText("Voice command menu is already active")
+            return
+        }
+        
+        // Reset audio engine and recognition task before starting
+        audioEngine.stop()
+        if audioEngine.inputNode.numberOfInputs > 0 {
+            audioEngine.inputNode.removeTap(onBus: 0)
+        }
+        
+        if recognitionTask != nil {
+            recognitionTask?.cancel()
+            recognitionTask = nil
+        }
+        
+        if recognitionRequest != nil {
+            recognitionRequest?.endAudio()
+            recognitionRequest = nil
+        }
+        
+        // Request speech recognition authorization with better error handling
+        SFSpeechRecognizer.requestAuthorization { [weak self] authStatus in
+            guard let self = self else { return }
+            
+            DispatchQueue.main.async {
+                switch authStatus {
+                case .authorized:
+                    print("Speech recognition authorized, activating voice command menu")
+                    self.isVoiceCommandMenuActive = true
+                    self.showMicrophoneIndicator()
+                    self.speakText("Welcome to voice command menu. Say help to hear available commands.")
+                    
+                    // Start speech recognition after a short delay to allow welcome message to be spoken
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                        print("Starting initial speech recognition")
+                        self.startSpeechRecognition()
+                    }
+                    
+                case .denied:
+                    print("Speech recognition permission denied")
+                    self.speakText("Speech recognition permission denied. Please enable microphone access in Settings.")
+                    
+                case .restricted, .notDetermined:
+                    print("Speech recognition not available or not determined")
+                    self.speakText("Speech recognition not available. Please try again.")
+                    
+                @unknown default:
+                    print("Unknown speech recognition authorization status")
+                    self.speakText("Speech recognition not available. Please try again.")
+                }
+            }
+        }
+    }
+
+    func showMicrophoneIndicator() {
+        // Create a visual indicator for active voice command mode
+        if voiceCommandMicIndicator == nil {
+            let indicator = UIView(frame: CGRect(x: 0, y: 0, width: 60, height: 60))
+            indicator.backgroundColor = UIColor.red.withAlphaComponent(0.5)
+            indicator.layer.cornerRadius = 30
+            indicator.center = CGPoint(x: videoPreview.bounds.width - 50, y: 70)
+            
+            // Add microphone icon or label if needed
+            let micLabel = UILabel(frame: indicator.bounds)
+            micLabel.text = "🎤"
+            micLabel.textAlignment = .center
+            micLabel.font = UIFont.systemFont(ofSize: 30)
+            indicator.addSubview(micLabel)
+            
+            // Add pulsating animation
+            let pulseAnimation = CABasicAnimation(keyPath: "transform.scale")
+            pulseAnimation.duration = 1.0
+            pulseAnimation.fromValue = 0.9
+            pulseAnimation.toValue = 1.1
+            pulseAnimation.autoreverses = true
+            pulseAnimation.repeatCount = Float.infinity
+            indicator.layer.add(pulseAnimation, forKey: "pulse")
+            
+            videoPreview.addSubview(indicator)
+            voiceCommandMicIndicator = indicator
+        }
+    }
+
+    func hideMicrophoneIndicator() {
+        voiceCommandMicIndicator?.removeFromSuperview()
+        voiceCommandMicIndicator = nil
+    }
+
+    // Improved audio session configuration
+    // Fixed startSpeechRecognition function with proper audio session configuration
+    func startSpeechRecognition() {
+        print("Starting speech recognition with fixed audio session")
+        
+        // Check if there's an existing task running and cancel it
+        if recognitionTask != nil {
+            recognitionTask?.cancel()
+            recognitionTask = nil
+        }
+        
+        // Create an audio session with fixed configuration
+        let audioSession = AVAudioSession.sharedInstance()
+        do {
+            // Use playAndRecord category which is compatible with defaultToSpeaker option
+            try audioSession.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
+            try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+        } catch {
+            print("Audio session setup failed: \(error)")
+            speakText("Could not start voice recognition. Please try again.")
+            return
+        }
+        
+        recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
+        
+        // Check if device has a recognition engine
+        guard let recognitionRequest = recognitionRequest else {
+            speakText("Speech recognition not available on this device")
+            return
+        }
+        
+        // We want to get results while the user is speaking
+        recognitionRequest.shouldReportPartialResults = true
+        
+        // Start recognition with better error handling
+        recognitionTask = speechRecognizer.recognitionTask(with: recognitionRequest) { [weak self] result, error in
+            guard let self = self else { return }
+            
+            var isFinal = false
+            
+            if let result = result {
+                // Get the transcript
+                let recognizedText = result.bestTranscription.formattedString
+                print("Recognized: \(recognizedText)")
+                isFinal = result.isFinal
+                
+                // If we have a complete command, process it
+                if isFinal && recognizedText.count > 0 {
+                    print("Final recognition result: \(recognizedText)")
+                    
+                    // Immediately stop audio engine
+                    self.audioEngine.stop()
+                    self.audioEngine.inputNode.removeTap(onBus: 0)
+                    self.recognitionRequest = nil
+                    
+                    // Process the command
+                    DispatchQueue.main.async {
+                        self.processVoiceCommand(recognizedText)
+                    }
+                }
+            }
+            
+            if error != nil {
+                print("Recognition error: \(error!)")
+                // Only restart if it's a non-fatal error
+                if self.isVoiceCommandMenuActive {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                        self.startSpeechRecognition()
+                    }
+                }
+            } else if isFinal {
+                // Already handled above
+            }
+        }
+        
+        // Configure the audio input with error handling
+        let recordingFormat = audioEngine.inputNode.outputFormat(forBus: 0)
+        
+        // Make sure we remove any existing tap first
+        if audioEngine.inputNode.numberOfInputs > 0 {
+            audioEngine.inputNode.removeTap(onBus: 0)
+        }
+        
+        audioEngine.inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { buffer, _ in
+            self.recognitionRequest?.append(buffer)
+        }
+        
+        // Start the audio engine with better error handling
+        do {
+            audioEngine.prepare()
+            try audioEngine.start()
+            print("Audio engine started successfully")
+        } catch {
+            print("Audio engine failed to start: \(error)")
+            speakText("Could not start voice recognition. Please try again.")
+        }
+    }
+    
+    // Fixed stop voice command menu function
+    func stopVoiceCommandMenu() {
+        print("Stopping voice command menu with proper cleanup")
+        isVoiceCommandMenuActive = false
+        hideMicrophoneIndicator()
+        
+        // Stop speech recognition and clean up
+        if recognitionTask != nil {
+            recognitionTask?.cancel()
+            recognitionTask = nil
+        }
+        
+        if recognitionRequest != nil {
+            recognitionRequest?.endAudio()
+            recognitionRequest = nil
+        }
+        
+        audioEngine.stop()
+        if audioEngine.inputNode.numberOfInputs > 0 {
+            audioEngine.inputNode.removeTap(onBus: 0)
+        }
+        
+        // Reset audio session with better error handling
+        do {
+            // Set to ambient which is least likely to cause issues
+            try AVAudioSession.sharedInstance().setCategory(.ambient)
+            try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        } catch {
+            print("Failed to deactivate audio session: \(error)")
+            // No need for further error handling here
+        }
+        
+        speakText("Voice command menu closed")
+    }
+
+
+    @objc func handleTripleTap() {
+        print("Triple tap detected")
+        
+        // Eğer zaten sesli komut menüsü aktifse, kapat
+        if isVoiceCommandMenuActive {
+            stopVoiceCommandMenu()
+            return
+        }
+        
+        // Sesli komut menüsünü başlat
+        startVoiceCommandMenu()
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        slider.value = 30
+        setLabels()
+        setUpBoundingBoxViews()
+        setUpOrientationChangeNotification()
+        
+        // Request speech recognition authorization
+        SFSpeechRecognizer.requestAuthorization { authStatus in
+          // Do nothing here, we'll handle authorization in startVoiceCommandMenu
+        }
+        
+        // Double tap gesture recognizer ekleme
+        let doubleTapGesture = UITapGestureRecognizer(target: self, action: #selector(handleDoubleTap))
+        doubleTapGesture.numberOfTapsRequired = 2
+        doubleTapGesture.delaysTouchesBegan = true
+        
+        // Triple tap gesture recognizer ekleme
+        let tripleTapGesture = UITapGestureRecognizer(target: self, action: #selector(handleTripleTap))
+        tripleTapGesture.numberOfTapsRequired = 3
+        tripleTapGesture.delaysTouchesBegan = true
+        
+        // Triple tap'in double tap ile çakışmasını önle
+        doubleTapGesture.require(toFail: tripleTapGesture)
+          
+        // Varsa diğer gesture recognizer'lar ile çakışmayı önle
+        if let existingGestures = videoPreview.gestureRecognizers {
+            for gesture in existingGestures {
+                if let tapGesture = gesture as? UITapGestureRecognizer {
+                    tapGesture.require(toFail: doubleTapGesture)
+                    tapGesture.require(toFail: tripleTapGesture)
+                }
+            }
+        }
+          
+        videoPreview.addGestureRecognizer(doubleTapGesture)
+        videoPreview.addGestureRecognizer(tripleTapGesture)
+        videoPreview.isUserInteractionEnabled = true
+        videoPreview.isMultipleTouchEnabled = true
+        
+        startVideo()
+        // setModel()
+    }
 
   override func viewWillTransition(
     to size: CGSize, with coordinator: any UIViewControllerTransitionCoordinator
@@ -167,6 +722,9 @@ class ViewController: UIViewController {
     case 4:
       self.labelName.text = "YOLO11x"
       mlModel = try! yolo11x(configuration: .init()).model
+    case 5:
+      self.labelName.text = "YOLObest"
+      mlModel = try! BestLicensePlateModel(configuration: .init()).model
     default:
       break
     }
@@ -174,7 +732,7 @@ class ViewController: UIViewController {
     setUpBoundingBoxViews()
     activityIndicator.stopAnimating()
   }
-
+  
   func setModel() {
 
     /// VNCoreMLModel
@@ -496,274 +1054,465 @@ class ViewController: UIViewController {
     }
   }
 
-  func show(predictions: [VNRecognizedObjectObservation]) {
-    var str = ""
-    // date
-    let date = Date()
-    let calendar = Calendar.current
-    let hour = calendar.component(.hour, from: date)
-    let minutes = calendar.component(.minute, from: date)
-    let seconds = calendar.component(.second, from: date)
-    let nanoseconds = calendar.component(.nanosecond, from: date)
-    let sec_day =
-      Double(hour) * 3600.0 + Double(minutes) * 60.0 + Double(seconds) + Double(nanoseconds) / 1E9  // seconds in the day
+    func show(predictions: [VNRecognizedObjectObservation]) {
+      var str = ""
+      // date
+      let date = Date()
+      let calendar = Calendar.current
+      let hour = calendar.component(.hour, from: date)
+      let minutes = calendar.component(.minute, from: date)
+      let seconds = calendar.component(.second, from: date)
+      let nanoseconds = calendar.component(.nanosecond, from: date)
+      let sec_day =
+        Double(hour) * 3600.0 + Double(minutes) * 60.0 + Double(seconds) + Double(nanoseconds) / 1E9  // seconds in the day
 
-    self.labelSlider.text =
-      String(predictions.count) + " items (max " + String(Int(slider.value)) + ")"
-    let width = videoPreview.bounds.width  // 375 pix
-    let height = videoPreview.bounds.height  // 812 pix
+      self.labelSlider.text =
+        String(predictions.count) + " items (max " + String(Int(slider.value)) + ")"
+      let width = videoPreview.bounds.width  // 375 pix
+      let height = videoPreview.bounds.height  // 812 pix
 
-    if UIDevice.current.orientation == .portrait {
+      if UIDevice.current.orientation == .portrait {
 
-      // ratio = videoPreview AR divided by sessionPreset AR
-      var ratio: CGFloat = 1.0
-      if videoCapture.captureSession.sessionPreset == .photo {
-        ratio = (height / width) / (4.0 / 3.0)  // .photo
+        // ratio = videoPreview AR divided by sessionPreset AR
+        var ratio: CGFloat = 1.0
+        if videoCapture.captureSession.sessionPreset == .photo {
+          ratio = (height / width) / (4.0 / 3.0)  // .photo
+        } else {
+          ratio = (height / width) / (16.0 / 9.0)  // .hd4K3840x2160, .hd1920x1080, .hd1280x720 etc.
+        }
+
+        for i in 0..<boundingBoxViews.count {
+          if i < predictions.count && i < Int(slider.value) {
+            let prediction = predictions[i]
+
+            var rect = prediction.boundingBox  // normalized xywh, origin lower left
+            switch UIDevice.current.orientation {
+            case .portraitUpsideDown:
+              rect = CGRect(
+                x: 1.0 - rect.origin.x - rect.width,
+                y: 1.0 - rect.origin.y - rect.height,
+                width: rect.width,
+                height: rect.height)
+            case .landscapeLeft:
+              rect = CGRect(
+                x: rect.origin.x,
+                y: rect.origin.y,
+                width: rect.width,
+                height: rect.height)
+            case .landscapeRight:
+              rect = CGRect(
+                x: rect.origin.x,
+                y: rect.origin.y,
+                width: rect.width,
+                height: rect.height)
+            case .unknown:
+              print("The device orientation is unknown, the predictions may be affected")
+              fallthrough
+            default: break
+            }
+
+            if ratio >= 1 {  // iPhone ratio = 1.218
+              let offset = (1 - ratio) * (0.5 - rect.minX)
+              let transform = CGAffineTransform(scaleX: 1, y: -1).translatedBy(x: offset, y: -1)
+              rect = rect.applying(transform)
+              rect.size.width *= ratio
+            } else {  // iPad ratio = 0.75
+              let offset = (ratio - 1) * (0.5 - rect.maxY)
+              let transform = CGAffineTransform(scaleX: 1, y: -1).translatedBy(x: 0, y: offset - 1)
+              rect = rect.applying(transform)
+              ratio = (height / width) / (3.0 / 4.0)
+              rect.size.height /= ratio
+            }
+
+            // Scale normalized to pixels [375, 812] [width, height]
+            rect = VNImageRectForNormalizedRect(rect, Int(width), Int(height))
+
+            // The labels array is a list of VNClassificationObservation objects,
+            // with the highest scoring class first in the list.
+            let bestClass = prediction.labels[0].identifier
+            let confidence = prediction.labels[0].confidence
+            // print(confidence, rect)  // debug (confidence, xywh) with xywh origin top left (pixels)
+            let label = String(format: "%@ %.1f", bestClass, confidence * 100)
+            let alpha = CGFloat((confidence - 0.2) / (1.0 - 0.2) * 0.9)
+            // Show the bounding box.
+            boundingBoxViews[i].show(
+              frame: rect,
+              label: label,
+              color: colors[bestClass] ?? UIColor.white,
+              alpha: alpha)  // alpha 0 (transparent) to 1 (opaque) for conf threshold 0.2 to 1.0)
+            
+            // Check for license plate proximity (large bounding box)
+            if bestClass.lowercased().contains("license_plate") && confidence > 0.5 {
+                // Calculate relative size of the plate compared to the screen
+                let boxArea = rect.width * rect.height
+                let screenArea = width * height
+                let relativeSizeRatio = boxArea / screenArea
+                
+                // Or check if either dimension is large compared to screen
+                let widthRatio = rect.width / width
+                let heightRatio = rect.height / height
+                
+                // Determine if this license plate is too close
+                if widthRatio > proximityThreshold || heightRatio > proximityThreshold {
+                    // Only warn once every few seconds
+                    let currentTime = CACurrentMediaTime()
+                    if currentTime - lastProximityWarningTime > proximityWarningCooldown {
+                        lastProximityWarningTime = currentTime
+                        
+                        // Get plate position
+                        let position = determinePlatePosition(rect: rect, viewWidth: width)
+                        
+                        // Alert user about nearby license plate
+                        let warningText = "Attention, license plate \(position) very close"
+                        speakText(warningText)
+                    }
+                }
+            }
+
+            if developerMode {
+              // Write
+              if save_detections {
+                str += String(
+                  format: "%.3f %.3f %.3f %@ %.2f %.1f %.1f %.1f %.1f\n",
+                  sec_day, freeSpace(), UIDevice.current.batteryLevel, bestClass, confidence,
+                  rect.origin.x, rect.origin.y, rect.size.width, rect.size.height)
+              }
+            }
+          } else {
+            boundingBoxViews[i].hide()
+          }
+        }
       } else {
-        ratio = (height / width) / (16.0 / 9.0)  // .hd4K3840x2160, .hd1920x1080, .hd1280x720 etc.
-      }
+          let frameAspectRatio = longSide / shortSide
+          let viewAspectRatio = width / height
+          var scaleX: CGFloat = 1.0
+          var scaleY: CGFloat = 1.0
+          var offsetX: CGFloat = 0.0
+          var offsetY: CGFloat = 0.0
+          
+          if frameAspectRatio > viewAspectRatio {
+              scaleY = height / shortSide
+              scaleX = scaleY
+              offsetX = (longSide * scaleX - width) / 2
+          } else {
+              scaleX = width / longSide
+              scaleY = scaleX
+              offsetY = (shortSide * scaleY - height) / 2
+          }
+          
+          for i in 0..<boundingBoxViews.count {
+                  if i < predictions.count {
+                    let prediction = predictions[i]
 
-      for i in 0..<boundingBoxViews.count {
-        if i < predictions.count && i < Int(slider.value) {
-          let prediction = predictions[i]
+                    var rect = prediction.boundingBox
 
-          var rect = prediction.boundingBox  // normalized xywh, origin lower left
-          switch UIDevice.current.orientation {
-          case .portraitUpsideDown:
-            rect = CGRect(
-              x: 1.0 - rect.origin.x - rect.width,
-              y: 1.0 - rect.origin.y - rect.height,
-              width: rect.width,
-              height: rect.height)
-          case .landscapeLeft:
-            rect = CGRect(
-              x: rect.origin.x,
-              y: rect.origin.y,
-              width: rect.width,
-              height: rect.height)
-          case .landscapeRight:
-            rect = CGRect(
-              x: rect.origin.x,
-              y: rect.origin.y,
-              width: rect.width,
-              height: rect.height)
-          case .unknown:
-            print("The device orientation is unknown, the predictions may be affected")
-            fallthrough
-          default: break
+                    rect.origin.x = rect.origin.x * longSide * scaleX - offsetX
+                    rect.origin.y =
+                      height
+                      - (rect.origin.y * shortSide * scaleY - offsetY + rect.size.height * shortSide * scaleY)
+                    rect.size.width *= longSide * scaleX
+                    rect.size.height *= shortSide * scaleY
+
+                    let bestClass = prediction.labels[0].identifier
+                    let confidence = prediction.labels[0].confidence
+
+                    let label = String(format: "%@ %.1f", bestClass, confidence * 100)
+                    let alpha = CGFloat((confidence - 0.2) / (1.0 - 0.2) * 0.9)
+                    // Show the bounding box.
+                    boundingBoxViews[i].show(
+                      frame: rect,
+                      label: label,
+                      color: colors[bestClass] ?? UIColor.white,
+                      alpha: alpha)  // alpha 0 (transparent) to 1 (opaque) for conf threshold 0.2 to 1.0)
+                      
+                    // Check for license plate proximity (large bounding box)
+                    if bestClass.lowercased().contains("license_plate") && confidence > 0.5 {
+                        // Calculate relative size of the plate compared to the screen
+                        let boxArea = rect.width * rect.height
+                        let screenArea = width * height
+                        let relativeSizeRatio = boxArea / screenArea
+                        
+                        // Or check if either dimension is large compared to screen
+                        let widthRatio = rect.width / width
+                        let heightRatio = rect.height / height
+                        
+                        // Determine if this license plate is too close
+                        if widthRatio > proximityThreshold || heightRatio > proximityThreshold {
+                            // Only warn once every few seconds
+                            let currentTime = CACurrentMediaTime()
+                            if currentTime - lastProximityWarningTime > proximityWarningCooldown {
+                                lastProximityWarningTime = currentTime
+                                
+                                // Get plate position
+                                let position = determinePlatePosition(rect: rect, viewWidth: width)
+                                
+                                // Alert user about nearby license plate
+                                let warningText = "Attention, license plate \(position) very close"
+                                speakText(warningText)
+                            }
+                        }
+                    }
+                  } else {
+                    boundingBoxViews[i].hide()
+                  }
+                }
+              }
+              // Write
+              if developerMode {
+                if save_detections {
+                  saveText(text: str, file: "detections.txt")  // Write stats for each detection
+                }
+                if save_frames {
+                  str = String(
+                    format: "%.3f %.3f %.3f %.3f %.1f %.1f %.1f\n",
+                    sec_day, freeSpace(), memoryUsage(), UIDevice.current.batteryLevel,
+                    self.t1 * 1000, self.t2 * 1000, 1 / self.t4)
+                  saveText(text: str, file: "frames.txt")  // Write stats for each image
+                }
+              }
+
+              // Debug
+              // print(str)
+              // print(UIDevice.current.identifierForVendor!)
+              // saveImage()
+            }
+
+          // Double tap işleme
+            @objc func handleDoubleTap()
+            {
+                print("Double tap triggered") // Debug için log
+                
+                // Eğer zaten okuma yapılıyorsa, çık
+                if isReading
+                {
+                    print("Already reading, exiting")
+                    return
+                }
+                
+                // Mevcut tespit edilen tüm plakaları kaydet
+                platesQueue = [] // Temizle
+                for i in 0..<boundingBoxViews.count
+                {
+                    if !boundingBoxViews[i].shapeLayer.isHidden
+                    {
+                        // Etiketi string olarak al
+                        let boxLabel = boundingBoxViews[i].textLayer.string as? String ?? ""
+                        print("Found box with label: \(boxLabel)")
+                        
+                        if boxLabel.lowercased().contains("license_plate")
+                        {
+                            print("Found license plate")
+                            // Bounding box'ın şeklinden frame bilgisini al
+                            if let path = boundingBoxViews[i].shapeLayer.path
+                            {
+                                let boxFrame = UIBezierPath(cgPath: path).bounds
+                                platesQueue.append((boxFrame, boxLabel))
+                                print("Added to queue: \(boxFrame), \(boxLabel)")
+                            }
+                        }
+                    }
+                }
+        
+        // Hiç plaka yoksa, bildir ve çık
+        if platesQueue.isEmpty {
+            print("No license plates found")
+            speakText("No license plate detected")
+            return
+        }
+        
+        print("Starting to read \(platesQueue.count) plates")
+        // Okuma işlemini başlat
+        isReading = true
+        readNextPlate()
+    }
+
+    // New function to provide directional guidance based on position
+    // New function to provide directional guidance based on position
+    func getDirectionalGuidance(for position: String) -> String {
+        switch position {
+        case "far left":
+            return "Turn sharply to the left and proceed forward."
+        case "on the left":
+            return "Turn slightly to the left and proceed forward."
+        case "directly in front":
+            return "Proceed straight ahead."
+        case "on the right":
+            return "Turn slightly to the right and proceed forward."
+        case "far right":
+            return "Turn sharply to the right and proceed forward."
+        default:
+            return "Look around to locate it."
+        }
+    }
+        // Improved plate position determination with more specific positions
+        func determinePlatePosition(rect: CGRect, viewWidth: CGFloat) -> String {
+            let centerX = rect.midX
+            let viewFifth = viewWidth / 5
+            
+            if centerX < viewFifth {
+                return "far left"
+            } else if centerX < viewFifth * 2 {
+                return "on the left"
+            } else if centerX < viewFifth * 3 {
+                return "directly in front"
+            } else if centerX < viewFifth * 4 {
+                return "on the right"
+            } else {
+                return "far right"
+            }
+        }
+
+          // Sıradaki plakayı oku
+          func readNextPlate() {
+            if platesQueue.isEmpty {
+              isReading = false
+              return
+            }
+            
+            let plate = platesQueue.removeFirst()
+            let position = determinePlatePosition(rect: plate.rect, viewWidth: videoPreview.bounds.width)
+            speakText("licence plate detected \(position)")
           }
 
-          if ratio >= 1 {  // iPhone ratio = 1.218
-            let offset = (1 - ratio) * (0.5 - rect.minX)
-            let transform = CGAffineTransform(scaleX: 1, y: -1).translatedBy(x: offset, y: -1)
-            rect = rect.applying(transform)
-            rect.size.width *= ratio
-          } else {  // iPad ratio = 0.75
-            let offset = (ratio - 1) * (0.5 - rect.maxY)
-            let transform = CGAffineTransform(scaleX: 1, y: -1).translatedBy(x: 0, y: offset - 1)
-            rect = rect.applying(transform)
-            ratio = (height / width) / (3.0 / 4.0)
-            rect.size.height /= ratio
+          // Metni sesli oku
+    
+    // Fixed speech text function with consistent audio session
+    func speakText(_ text: String) {
+        print("Speaking with fixed audio session: \(text)")
+        
+        // Make sure we're not already speaking something
+        if speechSynthesizer.isSpeaking {
+            speechSynthesizer.stopSpeaking(at: .immediate)
+        }
+        
+        let utterance = AVSpeechUtterance(string: text)
+        utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
+        utterance.rate = 0.5
+        utterance.volume = 1.0
+        
+        // Configure audio session for playback
+        do {
+            // Use playback category for speaking which is more reliable
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch {
+            print("Audio session error for speech: \(error)")
+        }
+        
+        speechSynthesizer.delegate = self
+        speechSynthesizer.speak(utterance)
+    }
+
+
+          // Pinch to Zoom Start ---------------------------------------------------------------------------------------------
+          let minimumZoom: CGFloat = 1.0
+          let maximumZoom: CGFloat = 10.0
+          var lastZoomFactor: CGFloat = 1.0
+
+          @IBAction func pinch(_ pinch: UIPinchGestureRecognizer) {
+            let device = videoCapture.captureDevice
+
+            // Return zoom value between the minimum and maximum zoom values
+            func minMaxZoom(_ factor: CGFloat) -> CGFloat {
+              return min(min(max(factor, minimumZoom), maximumZoom), device.activeFormat.videoMaxZoomFactor)
+            }
+
+            func update(scale factor: CGFloat) {
+              do {
+                try device.lockForConfiguration()
+                defer {
+                  device.unlockForConfiguration()
+                }
+                device.videoZoomFactor = factor
+              } catch {
+                print("\(error.localizedDescription)")
+              }
+            }
+
+            let newScaleFactor = minMaxZoom(pinch.scale * lastZoomFactor)
+            switch pinch.state {
+            case .began, .changed:
+              update(scale: newScaleFactor)
+              self.labelZoom.text = String(format: "%.2fx", newScaleFactor)
+              self.labelZoom.font = UIFont.preferredFont(forTextStyle: .title2)
+            case .ended:
+              lastZoomFactor = minMaxZoom(newScaleFactor)
+              update(scale: lastZoomFactor)
+              self.labelZoom.font = UIFont.preferredFont(forTextStyle: .body)
+            default: break
+            }
+          }  // Pinch to Zoom End --------------------------------------------------------------------------------------------
+        }  // ViewController class End
+
+        extension ViewController: VideoCaptureDelegate {
+          func videoCapture(_ capture: VideoCapture, didCaptureVideoFrame sampleBuffer: CMSampleBuffer) {
+            predict(sampleBuffer: sampleBuffer)
           }
+        }
 
-          // Scale normalized to pixels [375, 812] [width, height]
-          rect = VNImageRectForNormalizedRect(rect, Int(width), Int(height))
+        // Konuşma bittiğinde çağrılacak delegate
+        extension ViewController: AVSpeechSynthesizerDelegate {
+          func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+            // Bir sonraki plakayı oku
+            readNextPlate()
+          }
+        }
 
-          // The labels array is a list of VNClassificationObservation objects,
-          // with the highest scoring class first in the list.
-          let bestClass = prediction.labels[0].identifier
-          let confidence = prediction.labels[0].confidence
-          // print(confidence, rect)  // debug (confidence, xywh) with xywh origin top left (pixels)
-          let label = String(format: "%@ %.1f", bestClass, confidence * 100)
-          let alpha = CGFloat((confidence - 0.2) / (1.0 - 0.2) * 0.9)
-          // Show the bounding box.
-          boundingBoxViews[i].show(
-            frame: rect,
-            label: label,
-            color: colors[bestClass] ?? UIColor.white,
-            alpha: alpha)  // alpha 0 (transparent) to 1 (opaque) for conf threshold 0.2 to 1.0)
+        // Programmatically save image
+        extension ViewController: AVCapturePhotoCaptureDelegate {
+          func photoOutput(
+            _ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?
+          ) {
+            if let error = error {
+              print("error occurred : \(error.localizedDescription)")
+            }
+            if let dataImage = photo.fileDataRepresentation() {
+              let dataProvider = CGDataProvider(data: dataImage as CFData)
+              let cgImageRef: CGImage! = CGImage(
+                jpegDataProviderSource: dataProvider!, decode: nil, shouldInterpolate: true,
+                intent: .defaultIntent)
+              var isCameraFront = false
+              if let currentInput = self.videoCapture.captureSession.inputs.first as? AVCaptureDeviceInput,
+                currentInput.device.position == .front
+              {
+                isCameraFront = true
+              }
+              var orientation: CGImagePropertyOrientation = isCameraFront ? .leftMirrored : .right
+              switch UIDevice.current.orientation {
+              case .landscapeLeft:
+                orientation = isCameraFront ? .downMirrored : .up
+              case .landscapeRight:
+                orientation = isCameraFront ? .upMirrored : .down
+              default:
+                break
+              }
+              var image = UIImage(cgImage: cgImageRef, scale: 0.5, orientation: .right)
+              if let orientedCIImage = CIImage(image: image)?.oriented(orientation),
+                let cgImage = CIContext().createCGImage(orientedCIImage, from: orientedCIImage.extent)
+              {
+                image = UIImage(cgImage: cgImage)
+              }
+              let imageView = UIImageView(image: image)
+              imageView.contentMode = .scaleAspectFill
+              imageView.frame = videoPreview.frame
+              let imageLayer = imageView.layer
+              videoPreview.layer.insertSublayer(imageLayer, above: videoCapture.previewLayer)
 
-          if developerMode {
-            // Write
-            if save_detections {
-              str += String(
-                format: "%.3f %.3f %.3f %@ %.2f %.1f %.1f %.1f %.1f\n",
-                sec_day, freeSpace(), UIDevice.current.batteryLevel, bestClass, confidence,
-                rect.origin.x, rect.origin.y, rect.size.width, rect.size.height)
+              let bounds = UIScreen.main.bounds
+              UIGraphicsBeginImageContextWithOptions(bounds.size, true, 0.0)
+              self.View0.drawHierarchy(in: bounds, afterScreenUpdates: true)
+              let img = UIGraphicsGetImageFromCurrentImageContext()
+              UIGraphicsEndImageContext()
+              imageLayer.removeFromSuperlayer()
+              let activityViewController = UIActivityViewController(
+                activityItems: [img!], applicationActivities: nil)
+              activityViewController.popoverPresentationController?.sourceView = self.View0
+              self.present(activityViewController, animated: true, completion: nil)
+              //
+              //            // Save to camera roll
+              //            UIImageWriteToSavedPhotosAlbum(img!, nil, nil, nil);
+            } else {
+              print("AVCapturePhotoCaptureDelegate Error")
             }
           }
-        } else {
-          boundingBoxViews[i].hide()
         }
-      }
-    } else {
-      let frameAspectRatio = longSide / shortSide
-      let viewAspectRatio = width / height
-      var scaleX: CGFloat = 1.0
-      var scaleY: CGFloat = 1.0
-      var offsetX: CGFloat = 0.0
-      var offsetY: CGFloat = 0.0
-
-      if frameAspectRatio > viewAspectRatio {
-        scaleY = height / shortSide
-        scaleX = scaleY
-        offsetX = (longSide * scaleX - width) / 2
-      } else {
-        scaleX = width / longSide
-        scaleY = scaleX
-        offsetY = (shortSide * scaleY - height) / 2
-      }
-
-      for i in 0..<boundingBoxViews.count {
-        if i < predictions.count {
-          let prediction = predictions[i]
-
-          var rect = prediction.boundingBox
-
-          rect.origin.x = rect.origin.x * longSide * scaleX - offsetX
-          rect.origin.y =
-            height
-            - (rect.origin.y * shortSide * scaleY - offsetY + rect.size.height * shortSide * scaleY)
-          rect.size.width *= longSide * scaleX
-          rect.size.height *= shortSide * scaleY
-
-          let bestClass = prediction.labels[0].identifier
-          let confidence = prediction.labels[0].confidence
-
-          let label = String(format: "%@ %.1f", bestClass, confidence * 100)
-          let alpha = CGFloat((confidence - 0.2) / (1.0 - 0.2) * 0.9)
-          // Show the bounding box.
-          boundingBoxViews[i].show(
-            frame: rect,
-            label: label,
-            color: colors[bestClass] ?? UIColor.white,
-            alpha: alpha)  // alpha 0 (transparent) to 1 (opaque) for conf threshold 0.2 to 1.0)
-        } else {
-          boundingBoxViews[i].hide()
-        }
-      }
-    }
-    // Write
-    if developerMode {
-      if save_detections {
-        saveText(text: str, file: "detections.txt")  // Write stats for each detection
-      }
-      if save_frames {
-        str = String(
-          format: "%.3f %.3f %.3f %.3f %.1f %.1f %.1f\n",
-          sec_day, freeSpace(), memoryUsage(), UIDevice.current.batteryLevel,
-          self.t1 * 1000, self.t2 * 1000, 1 / self.t4)
-        saveText(text: str, file: "frames.txt")  // Write stats for each image
-      }
-    }
-
-    // Debug
-    // print(str)
-    // print(UIDevice.current.identifierForVendor!)
-    // saveImage()
-  }
-
-  // Pinch to Zoom Start ---------------------------------------------------------------------------------------------
-  let minimumZoom: CGFloat = 1.0
-  let maximumZoom: CGFloat = 10.0
-  var lastZoomFactor: CGFloat = 1.0
-
-  @IBAction func pinch(_ pinch: UIPinchGestureRecognizer) {
-    let device = videoCapture.captureDevice
-
-    // Return zoom value between the minimum and maximum zoom values
-    func minMaxZoom(_ factor: CGFloat) -> CGFloat {
-      return min(min(max(factor, minimumZoom), maximumZoom), device.activeFormat.videoMaxZoomFactor)
-    }
-
-    func update(scale factor: CGFloat) {
-      do {
-        try device.lockForConfiguration()
-        defer {
-          device.unlockForConfiguration()
-        }
-        device.videoZoomFactor = factor
-      } catch {
-        print("\(error.localizedDescription)")
-      }
-    }
-
-    let newScaleFactor = minMaxZoom(pinch.scale * lastZoomFactor)
-    switch pinch.state {
-    case .began, .changed:
-      update(scale: newScaleFactor)
-      self.labelZoom.text = String(format: "%.2fx", newScaleFactor)
-      self.labelZoom.font = UIFont.preferredFont(forTextStyle: .title2)
-    case .ended:
-      lastZoomFactor = minMaxZoom(newScaleFactor)
-      update(scale: lastZoomFactor)
-      self.labelZoom.font = UIFont.preferredFont(forTextStyle: .body)
-    default: break
-    }
-  }  // Pinch to Zoom End --------------------------------------------------------------------------------------------
-}  // ViewController class End
-
-extension ViewController: VideoCaptureDelegate {
-  func videoCapture(_ capture: VideoCapture, didCaptureVideoFrame sampleBuffer: CMSampleBuffer) {
-    predict(sampleBuffer: sampleBuffer)
-  }
-}
-
-// Programmatically save image
-extension ViewController: AVCapturePhotoCaptureDelegate {
-  func photoOutput(
-    _ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?
-  ) {
-    if let error = error {
-      print("error occurred : \(error.localizedDescription)")
-    }
-    if let dataImage = photo.fileDataRepresentation() {
-      let dataProvider = CGDataProvider(data: dataImage as CFData)
-      let cgImageRef: CGImage! = CGImage(
-        jpegDataProviderSource: dataProvider!, decode: nil, shouldInterpolate: true,
-        intent: .defaultIntent)
-      var isCameraFront = false
-      if let currentInput = self.videoCapture.captureSession.inputs.first as? AVCaptureDeviceInput,
-        currentInput.device.position == .front
-      {
-        isCameraFront = true
-      }
-      var orientation: CGImagePropertyOrientation = isCameraFront ? .leftMirrored : .right
-      switch UIDevice.current.orientation {
-      case .landscapeLeft:
-        orientation = isCameraFront ? .downMirrored : .up
-      case .landscapeRight:
-        orientation = isCameraFront ? .upMirrored : .down
-      default:
-        break
-      }
-      var image = UIImage(cgImage: cgImageRef, scale: 0.5, orientation: .right)
-      if let orientedCIImage = CIImage(image: image)?.oriented(orientation),
-        let cgImage = CIContext().createCGImage(orientedCIImage, from: orientedCIImage.extent)
-      {
-        image = UIImage(cgImage: cgImage)
-      }
-      let imageView = UIImageView(image: image)
-      imageView.contentMode = .scaleAspectFill
-      imageView.frame = videoPreview.frame
-      let imageLayer = imageView.layer
-      videoPreview.layer.insertSublayer(imageLayer, above: videoCapture.previewLayer)
-
-      let bounds = UIScreen.main.bounds
-      UIGraphicsBeginImageContextWithOptions(bounds.size, true, 0.0)
-      self.View0.drawHierarchy(in: bounds, afterScreenUpdates: true)
-      let img = UIGraphicsGetImageFromCurrentImageContext()
-      UIGraphicsEndImageContext()
-      imageLayer.removeFromSuperlayer()
-      let activityViewController = UIActivityViewController(
-        activityItems: [img!], applicationActivities: nil)
-      activityViewController.popoverPresentationController?.sourceView = self.View0
-      self.present(activityViewController, animated: true, completion: nil)
-      //
-      //            // Save to camera roll
-      //            UIImageWriteToSavedPhotosAlbum(img!, nil, nil, nil);
-    } else {
-      print("AVCapturePhotoCaptureDelegate Error")
-    }
-  }
-}

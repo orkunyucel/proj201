@@ -2,8 +2,6 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key></key>
-	<string></string>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
@@ -21,7 +19,7 @@
 	<key>CFBundleShortVersionString</key>
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
-	<string>83</string>
+	<string>118</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
 	<key>LSRequiresIPhoneOS</key>
@@ -30,10 +28,14 @@
 	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>Ultralytics YOLO uses your camera to detect objects around you and display results in realtime on your screen 🚀</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>This app uses the microphone to listen for voice commands</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>To save results to Photo Library.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>To see images in Photo Library and apply AI object detection to them.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>This app uses speech recognition to understand voice commands</string>
 	<key>UIFileSharingEnabled</key>
 	<true/>
 	<key>UILaunchStoryboardName</key>
